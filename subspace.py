@@ -4,14 +4,15 @@ from sklearn.cluster.k_means_ import _tolerance, _labels_inertia, _init_centroid
 from sklearn.metrics.pairwise import pairwise_distances_argmin
 from sklearn.utils import check_random_state, as_float_array
 from sklearn.utils.extmath import row_norms, squared_norm
-from sklearn.utils.validation import check_is_fitted
 import scipy.sparse as sp
 import numpy as np
-import pandas as pd
 
 
 class SubspaceKMeans(BaseEstimator, ClusterMixin, TransformerMixin):
     def __init__(self, k=8, n_init=10, max_iter=300, tol=1e-4, tol_eig=-1e-10, random_state=None):
+        self.cluster_centers_, self.labels_, self.inertia_ = None, None, None
+        self.V_, self.m_ = None, None
+
         self.k = k
         self.n_init = n_init
         self.max_iter = max_iter
@@ -25,12 +26,28 @@ class SubspaceKMeans(BaseEstimator, ClusterMixin, TransformerMixin):
         if self.max_iter <= 0:
             raise ValueError('max_iter must be bigger than zero.')
 
-        self.cluster_centers_ = None
-        self.labels_ = None
-        self.inertia_ = None
-        self.feature_importances_ = None
-        self.V_ = None
-        self.m_ = None
+    def assignment_step_(self, X, V, centers, d, m, sample_weight, distances):
+        PC = np.eye(m, d)
+        XC = np.dot(np.dot(X, V), PC.T)
+        muC = np.dot(np.dot(centers, V), PC.T)
+
+        labels = pairwise_distances_argmin(XC, muC, metric_kwargs={'squared': True}).astype(np.int32)
+        centers = _k_means._centers_dense(X, sample_weight, labels, self.k, distances)
+        return centers, labels
+
+    def update_step_(self, X, centers, labels):
+        d = X.shape[1]
+        S = np.zeros((d, d))
+        for j in range(self.k):
+            Xj = X[:][labels == j] - centers[:][j]  # Xj - muj, for each j
+            S += np.dot(Xj.T, Xj)  # S += Sj
+        return S
+
+    def eigen_decomposition_(self, sigma):
+        eig_vals, eig_vecs = np.linalg.eigh(sigma)
+        V = eig_vecs[np.argsort(eig_vals)]
+        m = len(np.where(eig_vals < self.tol_eig)[0])
+        return V, m
 
     def subspace_kmeans_single_(self, X, sample_weight, x_squared_norms, tol, random_state):
         random_state = check_random_state(random_state)
@@ -44,31 +61,24 @@ class SubspaceKMeans(BaseEstimator, ClusterMixin, TransformerMixin):
 
         d = X.shape[1]        # dimentionality of original space
         m = d // 2            # dimentionality of clustered space
-        SD = np.dot(X.T, X)  # scatter matrix of the dataset in the original space
+        SD = np.dot(X.T, X)   # scatter matrix of the dataset in the original space
 
         # orthonormal matrix of a rigid transformation
         V, _ = np.linalg.qr(random_state.random_sample(d ** 2).reshape(d, d), mode='complete')
+
         for i in range(self.max_iter):
             # store centers for shift computation
             centers_old = centers.copy()
 
-            PC = np.eye(m, d)
-            XC = np.dot(np.dot(X, V), PC.T)
-            muC = np.dot(np.dot(centers, V), PC.T)
-            labels = pairwise_distances_argmin(XC, muC, metric_kwargs={'squared': True}).astype(np.int32)
+            # get the clusters' centers and labels
+            centers, labels = self.assignment_step_(X=X, V=V, centers=centers, d=d, m=m,
+                                                    sample_weight=sample_weight, distances=distances)
 
-            # computation of the means is also called the M-step of EM
-            centers = _k_means._centers_dense(X, sample_weight, labels, self.k, distances)
-
-            S = np.zeros((d, d))
-            for j in range(self.k):
-                Xj = X[:][labels == j] - centers[:][j]  # Xj - muj, for each j
-                S += np.dot(Xj.T, Xj)  # S += Sj
+            # sum of clusters' scatter matrices
+            S = self.update_step_(X, centers, labels)
 
             # sorted eigenvalues and eigenvectors of SIGMA=S-S_D (which is symmetric, hence used eigh)
-            eig_vals, eig_vecs = np.linalg.eigh(S - SD)
-            V = eig_vecs[np.argsort(eig_vals)]
-            m = len(np.where(eig_vals < self.tol_eig)[0])
+            V, m = self.eigen_decomposition_(S - SD)
             if m == 0:
                 raise ValueError('Dimensionality is 0. The dataset is better explained by a single cluster.')
 
@@ -107,7 +117,7 @@ class SubspaceKMeans(BaseEstimator, ClusterMixin, TransformerMixin):
         # precompute squared norms of data points
         x_squared_norms = row_norms(X, squared=True)
 
-        # computes a tolerance which is independent of the dataset
+        # precomputes a tolerance which is independent of the dataset
         tol = _tolerance(X, self.tol)
 
         for seed in random_state.randint(np.iinfo(np.int32).max, size=self.n_init):
@@ -119,22 +129,11 @@ class SubspaceKMeans(BaseEstimator, ClusterMixin, TransformerMixin):
                 self.cluster_centers_ = centers.copy()
                 self.inertia_ = inertia
 
+        # restore means
         self.cluster_centers_ += X_mean
 
-        # TODO: export to function ===============================================
-        d = X.shape[1]
-        S_D = np.dot(X.T, X)
-        S = np.zeros((d, d))
-        for i in range(self.k):
-            X_i = X[:][self.labels_ == i] - self.cluster_centers_[:][i]
-            S += np.dot(X_i.T, X_i)
-        sigma = S - S_D
-        self.feature_importances_, self.V_ = np.linalg.eigh(sigma)
-        self.m_ = len(np.where(self.feature_importances_ < self.tol_eig)[0])
-        # TODO: export to function  ===============================================
+        SD = np.dot(X.T, X)
+        S = self.update_step_(X, self.cluster_centers_, self.labels_)
+        self.V_, self.m_ = self.eigen_decomposition_(S - SD)
 
         return self
-
-# df = pd.read_csv('wine.csv')
-# lab = df.iloc[:, -1].tolist()
-# print(list(zip(SubspaceKMeans(k=3).fit(df.iloc[:, :-1]).labels_, lab)))
